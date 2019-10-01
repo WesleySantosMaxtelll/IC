@@ -1,23 +1,21 @@
-'''
-#Restore a character-level sequence to sequence model from to generate predictions.
-This script loads the ```s2s.h5``` model saved by [lstm_seq2seq.py
-](/examples/lstm_seq2seq/) and generates sequences from it. It assumes
-that no changes have been made (for example: ```latent_dim``` is unchanged,
-and the input data and model architecture are unchanged).
-See [lstm_seq2seq.py](/examples/lstm_seq2seq/) for more details on the
-model architecture and how it is trained.
-'''
-from __future__ import print_function
-
-from keras.models import Model, load_model
-from keras.layers import Input
+import pandas as pd
 import numpy as np
+import string
+from string import digits
+import matplotlib.pyplot as plt
+# %matplotlib inline
+import re
+from sklearn.utils import shuffle
+from sklearn.model_selection import train_test_split
+from keras.layers import Input, LSTM, Embedding, Dense
+from keras.models import Model
 import data_getter
 from math import ceil
-import re
-batch_size = 150
-epochs = 500
-num_textos = 20000
+from rouge import Rouge
+
+batch_size = 20
+epochs = 10
+num_textos = 100
 
 
 raw_data = data_getter.get_files(num_textos)
@@ -101,89 +99,202 @@ reverse_target_char_index = dict((i, word) for word, i in target_token_index.ite
 
 # Train - Test Split
 X, y = input_texts, target_texts
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size = 0.1)
+# print('{} {} {} {}'.format(len(X_train), len(y_train), len(X_test), len(y_test)))
+# X_train.to_pickle('Weights_Mar/X_train.pkl')
+# X_test.to_pickle('Weights_Mar/X_test.pkl')
 
-encoder_input_data = np.zeros(
-    (len(input_texts), max_encoder_seq_length, num_encoder_tokens),
-    dtype='float32')
+def generate_batch(X = X_train, y = y_train, batch_size = 128):
+    ''' Generate a batch of data '''
+    while True:
+        for j in range(0, len(X), batch_size):
+            encoder_input_data = np.zeros((batch_size, max_length_src),dtype='float32')
+            decoder_input_data = np.zeros((batch_size, max_length_tar),dtype='float32')
+            decoder_target_data = np.zeros((batch_size, max_length_tar, num_decoder_tokens),dtype='float32')
+            for i, (input_text, target_text) in enumerate(zip(X[j:j+batch_size], y[j:j+batch_size])):
+                for t, word in enumerate(input_text.split()):
+                    encoder_input_data[i, t] = input_token_index[word] # encoder input seq
+                for t, word in enumerate(target_text.split()):
+                    if t<len(target_text.split())-1:
+                        decoder_input_data[i, t] = target_token_index[word] # decoder input seq
+                    if t>0:
+                        # decoder target sequence (one hot encoded)
+                        # does not include the START_ token
+                        # Offset by one timestep
+                        decoder_target_data[i, t - 1, target_token_index[word]] = 1.
+            yield([encoder_input_data, decoder_input_data], decoder_target_data)
 
-for i, input_text in enumerate(input_texts):
-    for t, char in enumerate(input_text):
-        encoder_input_data[i, t, input_token_index[char]] = 1.
 
-# Restore the model and construct the encoder and decoder.
-model = load_model('{}-{}-nmt_weights.h5'.format(num_textos,epochs))
+def rouge_metric(y_true, y_pred):
+    rouge = Rouge()
+    scores = rouge.get_scores(y_pred, y_true, avg=True)
+    return scores
 
-encoder_inputs = model.input[0]   # input_1
-encoder_outputs, state_h_enc, state_c_enc = model.layers[2].output   # lstm_1
-encoder_states = [state_h_enc, state_c_enc]
+latent_dim = 50
+latent_dims = [10, 20]
+
+# Encoder
+encoder_inputs = Input(shape=(None,))
+enc_emb = Embedding(num_encoder_tokens, latent_dim, mask_zero = True)(encoder_inputs)
+# encoder_lstm = LSTM(latent_dim, return_state=True, return_sequences=True)
+
+outputs = enc_emb
+encoder_states = []
+for j in range(len(latent_dims))[::-1]:
+    outputs, h, c = LSTM(latent_dims[j], return_state=True, return_sequences=bool(j), dropout=0.2)(outputs)
+    encoder_states += [h, c]
+
+
+# Set up the decoder, setting the initial state of each layer to the state of the layer in the encoder
+# which is it's mirror (so for encoder: a->b->c, you'd have decoder initial states: c->b->a).
+
+decoder_inputs = Input(shape=(None,))
+dec_emb_layer = Embedding(num_decoder_tokens, latent_dim, mask_zero = True)
+dec_emb = dec_emb_layer(decoder_inputs)
+
+# decoder_inputs = Input(shape=(None, num_decoder_tokens))
+
+outputs = dec_emb
+output_layers = []
+for j in range(len(latent_dims)):
+    output_layers.append(
+        LSTM(latent_dims[len(latent_dims) - j - 1], return_sequences=True, return_state=True, dropout=0.2)
+    )
+    outputs, dh, dc = output_layers[-1](outputs, initial_state=encoder_states[2*j:2*(j+1)])
+
+
+decoder_dense = Dense(num_decoder_tokens, activation='softmax')
+decoder_outputs = decoder_dense(outputs)
+#
+# # Set up the decoder, using `encoder_states` as initial state.
+# decoder_inputs = Input(shape=(None,))
+# dec_emb_layer = Embedding(num_decoder_tokens, latent_dim, mask_zero = True)
+# dec_emb = dec_emb_layer(decoder_inputs)
+# # We set up our decoder to return full output sequences,
+# # and to return internal states as well. We don't use the
+#
+# out_layer1 = LSTM(latent_dim, return_sequences=True, return_state=True)
+# d_outputs, dh1, dc1 = out_layer1(dec_emb,initial_state= [state_h, state_c])
+# out_layer2 = LSTM(latent_dim, return_sequences=True, return_state=True)
+# final, dh2, dc2 = out_layer2(d_outputs, initial_state= [h2, c2])
+# decoder_dense = Dense(num_decoder_tokens, activation='softmax')
+# decoder_outputs = decoder_dense(final)
+
+# Define the model that will turn
+# `encoder_input_data` & `decoder_input_data` into `decoder_target_data`
+model = Model([encoder_inputs, decoder_inputs], decoder_outputs)
+
+model.compile(optimizer='rmsprop', loss='categorical_crossentropy', metrics=['acc'])
+
+# from IPython.display import Image
+# Image(retina=True, filename='train_model.png')
+
+train_samples = len(X_train)
+val_samples = len(X_test)
+
+# model.fit_generator(generator = generate_batch(X_train, y_train, batch_size = batch_size),
+#                     steps_per_epoch = ceil(train_samples/batch_size),
+#                     epochs=epochs,
+#                     validation_data = generate_batch(X_test, y_test, batch_size = batch_size),
+#                     validation_steps = ceil(val_samples/batch_size))
+#
+# model.save_weights('modelos/{}-{}-nmt_weights.h5'.format(num_textos,epochs))
+
+
+
+model.load_weights('modelos/{}-{}-nmt_weights.h5'.format(num_textos,epochs))
+
+
+# Define sampling models (modified for n-layer deep network)
 encoder_model = Model(encoder_inputs, encoder_states)
 
-decoder_inputs = model.input[1]   # input_2
-decoder_state_input_h = Input(shape=(latent_dim,), name='input_3')
-decoder_state_input_c = Input(shape=(latent_dim,), name='input_4')
-decoder_states_inputs = [decoder_state_input_h, decoder_state_input_c]
-decoder_lstm = model.layers[3]
-decoder_outputs, state_h_dec, state_c_dec = decoder_lstm(
-    decoder_inputs, initial_state=decoder_states_inputs)
-decoder_states = [state_h_dec, state_c_dec]
-decoder_dense = model.layers[4]
-decoder_outputs = decoder_dense(decoder_outputs)
+
+d_outputs = dec_emb
+decoder_states_inputs = []
+decoder_states = []
+for j in range(len(latent_dims))[::-1]:
+    current_state_inputs = [Input(shape=(latent_dims[j],)) for _ in range(2)]
+
+    temp = output_layers[len(latent_dims)-j-1](d_outputs, initial_state=current_state_inputs)
+
+    d_outputs, cur_states = temp[0], temp[1:]
+
+    decoder_states += cur_states
+    decoder_states_inputs += current_state_inputs
+
+decoder_outputs = decoder_dense(d_outputs)
 decoder_model = Model(
     [decoder_inputs] + decoder_states_inputs,
     [decoder_outputs] + decoder_states)
 
-# Reverse-lookup token index to decode sequences back to
-# something readable.
-reverse_input_char_index = dict(
-    (i, char) for char, i in input_token_index.items())
-reverse_target_char_index = dict(
-    (i, char) for char, i in target_token_index.items())
 
-
-# Decodes an input sequence.  Future work should support beam search.
 def decode_sequence(input_seq):
     # Encode the input as state vectors.
     states_value = encoder_model.predict(input_seq)
-
     # Generate empty target sequence of length 1.
-    target_seq = np.zeros((1, 1, num_decoder_tokens))
+    target_seq = np.zeros((1,1))
     # Populate the first character of target sequence with the start character.
-    target_seq[0, 0, target_token_index['\t']] = 1.
+    target_seq[0, 0] = target_token_index['START_']
 
     # Sampling loop for a batch of sequences
     # (to simplify, here we assume a batch of size 1).
     stop_condition = False
     decoded_sentence = ''
     while not stop_condition:
-        output_tokens, h, c = decoder_model.predict(
-            [target_seq] + states_value)
+        # print(target_seq)
+        # print('----------------------------')
+        # print([target_seq] + states_value)
+        upt = decoder_model.predict([target_seq] + states_value)
+        output_tokens = upt[0]
+        # print(upt)
+        # output_tokens, h, c, h1, c1 = decoder_model.predict([target_seq] + states_value)
 
         # Sample a token
         sampled_token_index = np.argmax(output_tokens[0, -1, :])
         sampled_char = reverse_target_char_index[sampled_token_index]
-        decoded_sentence += sampled_char
+        decoded_sentence += ' '+sampled_char
 
         # Exit condition: either hit max length
         # or find stop character.
-        if (sampled_char == '\n' or
-           len(decoded_sentence) > max_decoder_seq_length):
+        if (sampled_char == '_END' or
+           len(decoded_sentence) > 80):
             stop_condition = True
 
         # Update the target sequence (of length 1).
-        target_seq = np.zeros((1, 1, num_decoder_tokens))
-        target_seq[0, 0, sampled_token_index] = 1.
+        target_seq = np.zeros((1, 1))
+        target_seq[0, 0] = sampled_token_index
 
         # Update states
-        states_value = [h, c]
+        states_value = upt[1:]
 
     return decoded_sentence
 
+train_gen = generate_batch(X_train, y_train, batch_size = 1)
+# print(list(train_gen))
+k=-1
+# print(k)
 
-for seq_index in range(100):
-    # Take one sequence (part of the training set)
-    # for trying out decoding.
-    input_seq = encoder_input_data[seq_index: seq_index + 1]
+f= open("saidas/gerador_words-{}-{}.txt".format(num_textos,epochs),"w+")
+pred_text = []
+original_text = []
+saida = "["
+for _ in range(len(X_test)):
+    # print(next(train_gen))
+    k += 1
+    (input_seq, actual_output), _ = next(train_gen)
+    saida +="{"
     decoded_sentence = decode_sequence(input_seq)
-    print('-')
-    print('Input sentence:', input_texts[seq_index])
-    print('Decoded sentence:', decoded_sentence)
+    saida += "'reportagem' : '"+str(X_test[k:k+1][0])+"',"
+    saida+= "'original': '"+str(y_test[k:k+1][0])[6:-4]+"',"
+    original_text.append(str(y_test[k:k+1][0])[6:-4])
+    saida+= "'gerado': '"+str(decoded_sentence)[:-4]+"'}"
+    pred_text.append(decoded_sentence)
+    saida+= ', '
+    # print(saida)
+    # f.write(saida)
+
+rouge_value = rouge_metric(original_text, pred_text)
+saida+=str(rouge_value)+"]"
+f.write(saida)
+print(rouge_value)
+f.close()
