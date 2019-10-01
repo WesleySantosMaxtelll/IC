@@ -1,31 +1,23 @@
+
 import csv
 
+def get_files(num_samples):
+    path = '/home/maxtelll/Documents/arquivos/base-artigos/articles.csv'
+    resp = []
 
-class Getter:
-    
-    def __init__(self):
-        path = '/home/maxtelll/Documents/arquivos/ic_novo_backup/posicionamento/MTwitter-dev-unverified.csv'
+    def len_first(elemento):
+        return len(elemento[0])
 
-        with open(path, encoding='latin-1') as csv_file:
-            csv_reader = csv.reader(csv_file, delimiter=';')
-            self.data = []
-            line_count = 0
-            for row in csv_reader:
-                if line_count == 0:
-                    # print(f'Column names are {", ".join(row)}')
-                    line_count += 1
-                else:
-                    self.data.append(row)
-                    line_count += 1
+    with open(path, encoding='utf-8') as csv_file:
+        f = csv.reader(csv_file, delimiter=',')
+        next(f, None)
+        # textos, titulos = [], []
+        for i in f:
+            if len(i[0]) > 20 and len(i[1]) > 700:
+                resp.append([i[1], i[0]])
+        print(len(resp))
+        return sorted(resp, key=len_first)[:num_samples+1]
+        # return resp[:num_samples+1]
+        # return [textos[t] for t in range(num_samples)], [titulos[t] for t in range(num_samples)]
 
-    def get_label(self, label):
-        X, Y = [], []
-        for row in self.data:
-            if row[0] == label:
-                X.append(row[2])
-                Y.append(row[3])
-        return X, Y
-
-X, Y = Getter().get_label('cotas')
-# print(X)
-# print(len(Y))
+# print(get_files(40))
